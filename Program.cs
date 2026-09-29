@@ -13,8 +13,9 @@ app.UseCors();
 
 // =========================================================
 // 1. ПРИНЯТИЕ ЗАКАЗА
+//    GET /accept/{token}/{counterpartyId}
 // =========================================================
-app.MapGet("/accept", async (Guid token, long counterpartyId) =>
+app.MapGet("/accept/{token}/{counterpartyId}", (Guid token, long counterpartyId) =>
 {
     using var db = DBContextClass.CreateContext();
 
@@ -49,7 +50,7 @@ app.MapGet("/accept", async (Guid token, long counterpartyId) =>
         if (freshOrder.AcceptedByCounterpartyId == counterpartyId)
             return Results.Content(WrapHtml(
                 $"<h1>Вы уже взяли этот заказ</h1>" +
-                $"<p><a class='btn' href='/template?token={token}'>Скачать шаблон Excel</a></p>"),
+                $"<p><a class='btn' href='/template/{token}'>Скачать шаблон Excel</a></p>"),
                 "text/html; charset=utf-8");
 
         return Results.Content(WrapHtml(
@@ -73,14 +74,15 @@ app.MapGet("/accept", async (Guid token, long counterpartyId) =>
     return Results.Content(WrapHtml(
         $"<h1>Заказ №{freshOrder.OrderId} успешно взят!</h1>" +
         $"<p>Спасибо, <b>{counterparty.FullName}</b>!</p>" +
-        $"<p><a class='btn' href='/template?token={token}'>Скачать шаблон Excel</a></p>"),
+        $"<p><a class='btn' href='/template/{token}'>Скачать шаблон Excel</a></p>"),
         "text/html; charset=utf-8");
 });
 
 // =========================================================
 // 2. ВЫГРУЗКА EXCEL
+//    GET /template/{token}
 // =========================================================
-app.MapGet("/template", (Guid token) =>
+app.MapGet("/template/{token}", (Guid token) =>
 {
     using var db = DBContextClass.CreateContext();
 
