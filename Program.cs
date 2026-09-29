@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Potok.Data;
 using Potok.DataFolder;
@@ -139,7 +140,6 @@ app.MapPost("/decline/{token}/{counterpartyId}", (Guid token, long counterpartyI
         return Results.Content(WrapHtml("<h1>Контрагент не найден</h1>", token, counterpartyId),
             "text/html; charset=utf-8");
 
-    // Если уже взят — отказ невозможен
     if (order.AcceptedByCounterpartyId != null)
         return Results.Content(WrapHtml(
             "<h1>Отказ невозможен</h1>" +
@@ -147,7 +147,6 @@ app.MapPost("/decline/{token}/{counterpartyId}", (Guid token, long counterpartyI
             token, counterpartyId),
             "text/html; charset=utf-8");
 
-    // Сохраняем отказ
     try
     {
         db.Database.ExecuteSqlRaw(
@@ -155,16 +154,9 @@ app.MapPost("/decline/{token}/{counterpartyId}", (Guid token, long counterpartyI
             "VALUES ({0}, {1}, NOW())",
             order.OrderId, counterpartyId);
     }
-    catch
-    {
-        // Если таблицы нет — просто игнорируем, не критично
-    }
+    catch { }
 
-    return Results.Content(WrapHtml(
-        $"<h1>Вы отказались от заказа №{order.OrderId}</h1>" +
-        "<p>Ваш отказ зафиксирован. Спасибо за ответ!</p>" +
-        $"<p>Если передумаете — вы можете вернуться по ссылке из письма.</p>",
-        token, counterpartyId),
+    return Results.Content(WrapDeclined(token, counterpartyId, order.OrderId),
         "text/html; charset=utf-8");
 });
 
@@ -218,11 +210,120 @@ app.MapGet("/template/{token}", (Guid token) =>
 });
 
 // =========================================================
-// 5. ГЛАВНАЯ
+// 5. ЗАГРУЗКА ЗАПОЛНЕННОГО ФАЙЛА
+//    POST /upload/{token}
 // =========================================================
-app.MapGet("/", () => Results.Content(
-    WrapMainPage(),
-    "text/html; charset=utf-8"));
+app.MapPost("/upload/{token}", async (Guid token, HttpRequest request) =>
+{
+    using var db = DBContextClass.CreateContext();
+
+    var order = db.Orders
+        .Include(x => x.OrderItems)
+        .FirstOrDefault(x => x.PublicToken == token);
+
+    if (order == null)
+        return Results.Content(WrapHtml("<h1>Заказ не найден</h1>", token, 0),
+            "text/html; charset=utf-8");
+
+    if (order.AcceptedByCounterpartyId == null)
+        return Results.Content(WrapHtml("<h1>Заказ ещё не принят</h1>", token, 0),
+            "text/html; charset=utf-8");
+
+    // Уже обработан?
+    var existingDoc = db.Documents.FirstOrDefault(x => x.OrderId == order.OrderId);
+    if (existingDoc != null)
+        return Results.Content(WrapThanks(order), "text/html; charset=utf-8");
+
+    var form = await request.ReadFormAsync();
+    var file = form.Files.FirstOrDefault();
+
+    if (file == null || file.Length == 0)
+        return Results.Content(WrapUploadError(token, order.OrderId, "Файл не загружен"),
+            "text/html; charset=utf-8");
+
+    try
+    {
+        using var stream = new MemoryStream();
+        await file.CopyToAsync(stream);
+        stream.Position = 0;
+
+        using var wb = new ClosedXML.Excel.XLWorkbook(stream);
+        var ws = wb.Worksheet(1);
+
+        var rows = new List<(long oiId, decimal qty, string? sn, string? bn)>();
+        int row = 2;
+
+        while (!ws.Cell(row, 1).IsEmpty())
+        {
+            long oiId = (long)ws.Cell(row, 1).GetDouble();
+            decimal qty = (decimal)ws.Cell(row, 3).GetDouble();
+            string? sn = ws.Cell(row, 5).GetString();
+            string? bn = ws.Cell(row, 6).GetString();
+
+            rows.Add((oiId, qty,
+                string.IsNullOrWhiteSpace(sn) ? null : sn,
+                string.IsNullOrWhiteSpace(bn) ? null : bn));
+            row++;
+        }
+
+        if (rows.Count == 0)
+            return Results.Content(WrapUploadError(token, order.OrderId, "Файл пуст"),
+                "text/html; charset=utf-8");
+
+        using var tx = db.Database.BeginTransaction();
+
+        var docStatus = db.DocumentStatuses
+            .FirstOrDefault(x => x.Name == "Проведён");
+
+        var document = new Document
+        {
+            DocumentNumber = $"IN-{DateTime.Now:yyyyMMdd}-{order.OrderId}",
+            DocumentDate = DateTime.Now,
+            DocumentType = "Приход",
+            DocumentStatusId = docStatus?.DocumentStatusId ?? 1,
+            OrderId = order.OrderId,
+            WarehouseId = order.WarehouseId,
+            EmployeeId = order.AcceptedByCounterpartyId ?? 1
+        };
+        db.Documents.Add(document);
+        db.SaveChanges();
+
+        foreach (var (oiId, qty, sn, bn) in rows)
+        {
+            var oi = db.OrderItems.FirstOrDefault(x => x.OrderItemId == oiId);
+            if (oi == null) continue;
+
+            db.DocumentItems.Add(new DocumentItem
+            {
+                DocumentId = document.DocumentId,
+                NomenclatureId = oi.NomenclatureId,
+                SerialNumber = sn,
+                BatchNumber = bn,
+                Quantity = qty
+            });
+        }
+
+        var fileStatus = db.OrderStatuses
+            .FirstOrDefault(x => x.Name == "Файл получен");
+        if (fileStatus != null)
+            order.OrderStatusId = fileStatus.OrderStatusId;
+
+        db.SaveChanges();
+        tx.Commit();
+
+        return Results.Content(WrapThanks(order), "text/html; charset=utf-8");
+    }
+    catch (Exception ex)
+    {
+        return Results.Content(WrapUploadError(token, order.OrderId, ex.Message),
+            "text/html; charset=utf-8");
+    }
+});
+
+// =========================================================
+// 6. ГЛАВНАЯ
+// =========================================================
+app.MapGet("/", () => Results.Content(WrapMainPage(), "text/html; charset=utf-8"));
 
 app.Run();
 
@@ -230,6 +331,8 @@ app.Run();
 // =========================================================
 // HTML-ШАБЛОНЫ
 // =========================================================
+
+// ---------- Общая обёртка для простых страниц ----------
 static string WrapHtml(string content, Guid token, long cpId) => $@"
 <!DOCTYPE html>
 <html lang='ru'>
@@ -266,6 +369,8 @@ static string WrapHtml(string content, Guid token, long cpId) => $@"
 </body>
 </html>";
 
+
+// ---------- Главная страница ----------
 static string WrapMainPage() => @"
 <!DOCTYPE html>
 <html lang='ru'>
@@ -306,6 +411,7 @@ static string WrapMainPage() => @"
             <li>Просмотреть поступивший заказ</li>
             <li>Принять или отклонить его</li>
             <li>Скачать Excel-шаблон для заполнения</li>
+            <li>Загрузить заполненный файл обратно</li>
         </ul>
         <p style='margin-top:16px;font-size:13px;color:#68707C;'>
             Для этого откройте ссылку из письма, которое вам прислал администратор.
@@ -315,6 +421,8 @@ static string WrapMainPage() => @"
 </body>
 </html>";
 
+
+// ---------- Страница просмотра заказа ----------
 static string WrapView(Guid token, long cpId, Order order, string counterpartyName)
 {
     var itemsHtml = new System.Text.StringBuilder();
@@ -370,7 +478,8 @@ static string WrapView(Guid token, long cpId, Order order, string counterpartyNa
     .btn {{ flex: 1; padding: 16px 24px; border: none; border-radius: 10px;
             font-size: 15px; font-weight: 600; cursor: pointer;
             transition: all 0.2s; text-align: center; text-decoration: none;
-            display: inline-flex; align-items: center; justify-content: center; gap: 8px; }}
+            display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+            font-family: inherit; }}
     .btn-accept {{ background: #A78BFA; color: white; }}
     .btn-accept:hover {{ background: #B69CFF; transform: translateY(-1px); }}
     .btn-decline {{ background: transparent; color: #A9B0BB; border: 1px solid #2A303A; }}
@@ -415,7 +524,7 @@ static string WrapView(Guid token, long cpId, Order order, string counterpartyNa
         <div class='section-title'>Состав заказа</div>
         {itemsHtml}
 
-        <form method='post' action='/accept/{token}/{cpId}' style='display:inline;'>
+        <form method='post' action='/accept/{token}/{cpId}' style='display:block;'>
             <div class='actions'>
                 <button type='submit' class='btn btn-accept'>
                     ✓ Принять заказ
@@ -435,6 +544,8 @@ static string WrapView(Guid token, long cpId, Order order, string counterpartyNa
 </html>";
 }
 
+
+// ---------- Страница «Заказ принят» с формой загрузки ----------
 static string WrapAccepted(Guid token, long cpId, Order order)
 {
     return $@"
@@ -450,43 +561,236 @@ static string WrapAccepted(Guid token, long cpId, Order order)
             background: #111318; color: #F1F3F5;
             min-height: 100vh; display: flex; align-items: center; justify-content: center;
             padding: 24px; line-height: 1.5; }}
-    .container {{ max-width: 560px; width: 100%; text-align: center; }}
+    .container {{ max-width: 600px; width: 100%; }}
     .check {{ width: 80px; height: 80px; margin: 0 auto 24px;
               background: linear-gradient(135deg, #63C7A0, #3FA37F);
               border-radius: 50%; display: flex; align-items: center; justify-content: center;
               font-size: 40px; }}
-    h1 {{ font-size: 28px; margin-bottom: 12px; }}
-    p {{ color: #A9B0BB; margin-bottom: 24px; }}
-    .btn {{ display: inline-block; padding: 16px 32px;
+    h1 {{ font-size: 28px; margin-bottom: 12px; text-align: center; }}
+    .subtitle {{ color: #A9B0BB; margin-bottom: 24px; text-align: center; }}
+    .card {{ background: #1D2128; border: 1px solid #2A303A;
+             border-radius: 16px; padding: 28px; text-align: left; margin-bottom: 16px; }}
+    .step-title {{ color: #A78BFA; font-size: 13px; font-weight: 600;
+                   text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px;
+                   display: flex; align-items: center; }}
+    .step-num {{ display: inline-flex; width: 24px; height: 24px;
+                 align-items: center; justify-content: center;
+                 background: #A78BFA; color: white;
+                 border-radius: 50%; font-size: 13px; font-weight: 700; margin-right: 8px; }}
+    .btn {{ display: inline-block; padding: 14px 28px;
             background: #A78BFA; color: white;
             text-decoration: none; border-radius: 10px;
-            font-weight: 600; font-size: 15px; transition: background 0.2s; }}
+            font-weight: 600; font-size: 15px; transition: background 0.2s;
+            border: none; cursor: pointer; width: 100%; text-align: center;
+            font-family: inherit; }}
     .btn:hover {{ background: #B69CFF; }}
-    .info {{ background: #1D2128; border: 1px solid #2A303A; border-radius: 12px;
-             padding: 20px; margin-bottom: 24px; text-align: left; }}
-    .info b {{ color: #A78BFA; }}
+    .divider {{ height: 1px; background: #2A303A; margin: 20px 0; }}
+    .upload-form {{ margin-top: 16px; }}
+    .file-input-wrap {{ border: 2px dashed #2A303A; border-radius: 10px;
+                        padding: 24px; text-align: center; margin-bottom: 12px;
+                        transition: border-color 0.2s; cursor: pointer;
+                        display: block; }}
+    .file-input-wrap:hover {{ border-color: #A78BFA; }}
+    .file-input-wrap input {{ display: none; }}
+    .file-input-label {{ color: #A9B0BB; font-size: 14px; cursor: pointer; }}
+    .file-input-label b {{ color: #A78BFA; }}
+    .file-name {{ color: #63C7A0; font-size: 13px; margin-top: 8px; display: none; }}
+    .info-note {{ color: #68707C; font-size: 13px; margin-bottom: 16px; }}
 </style>
 </head>
 <body>
 <div class='container'>
     <div class='check'>✓</div>
     <h1>Заказ №{order.OrderId} принят!</h1>
-    <p>Спасибо! Теперь скачайте Excel-шаблон и заполните серийные номера.</p>
+    <p class='subtitle'>Теперь скачайте шаблон, заполните серийные номера и загрузите файл обратно.</p>
+
+    <div class='card'>
+        <div class='step-title'>
+            <span class='step-num'>1</span>Скачайте шаблон
+        </div>
+        <p class='info-note'>Excel-файл с составом заказа</p>
+        <a href='/template/{token}' class='btn'>
+            📄 Скачать шаблон Excel
+        </a>
+
+        <div class='divider'></div>
+
+        <div class='step-title'>
+            <span class='step-num'>2</span>Заполните и загрузите
+        </div>
+        <p class='info-note'>Заполните колонки «Серийный номер» и «Номер партии», затем загрузите файл</p>
+
+        <form method='post' action='/upload/{token}' enctype='multipart/form-data' class='upload-form'>
+            <label class='file-input-wrap' for='fileInput'>
+                <input type='file' id='fileInput' name='file' accept='.xlsx,.xls'
+                       onchange='showFileName(this)'>
+                <div class='file-input-label'>
+                    <b>Выберите файл</b><br>
+                    или перетащите сюда
+                </div>
+                <div class='file-name' id='fileName'></div>
+            </label>
+            <button type='submit' class='btn'>
+                📤 Отправить заполненный файл
+            </button>
+        </form>
+    </div>
+</div>
+
+<script>
+function showFileName(input) {{
+    var fileNameDiv = document.getElementById('fileName');
+    if (input.files && input.files[0]) {{
+        fileNameDiv.textContent = '✓ ' + input.files[0].name;
+        fileNameDiv.style.display = 'block';
+    }}
+}}
+</script>
+</body>
+</html>";
+}
+
+
+// ---------- Страница «Вы отказались» ----------
+static string WrapDeclined(Guid token, long cpId, long orderId)
+{
+    return $@"
+<!DOCTYPE html>
+<html lang='ru'>
+<head>
+<meta charset='utf-8'>
+<title>Отказ от заказа — Поток</title>
+<style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #111318; color: #F1F3F5;
+            min-height: 100vh; display: flex; align-items: center; justify-content: center;
+            padding: 24px; text-align: center; }}
+    .container {{ max-width: 520px; }}
+    .icon {{ width: 80px; height: 80px; margin: 0 auto 24px;
+             background: linear-gradient(135deg, #6B7280, #4B5563);
+             border-radius: 50%; display: flex; align-items: center; justify-content: center;
+             font-size: 40px; }}
+    h1 {{ font-size: 28px; margin-bottom: 12px; }}
+    p {{ color: #A9B0BB; margin-bottom: 12px; }}
+    .info {{ background: #1D2128; border: 1px solid #2A303A;
+             border-radius: 12px; padding: 20px; margin-top: 24px;
+             text-align: left; font-size: 14px; color: #A9B0BB; }}
+    .info b {{ color: #A78BFA; }}
+</style>
+</head>
+<body>
+<div class='container'>
+    <div class='icon'>✕</div>
+    <h1>Вы отказались</h1>
+    <p>Отказ от заказа №{orderId} зафиксирован.</p>
 
     <div class='info'>
-        <p style='color:#F1F3F5;font-size:14px;margin-bottom:12px;'>
-            <b>Что делать дальше:</b>
+        <p>Спасибо за ответ! Если у вас есть вопросы — свяжитесь с администратором.</p>
+        <p style='margin-top:12px;color:#68707C;'>
+            Можете закрыть эту страницу.
         </p>
-        <ol style='color:#A9B0BB;font-size:14px;padding-left:20px;'>
-            <li style='margin-bottom:6px;'>Скачайте Excel-шаблон по кнопке ниже</li>
-            <li style='margin-bottom:6px;'>Заполните колонки «Серийный номер» и «Номер партии»</li>
-            <li>Отправьте файл на почту администратора</li>
-        </ol>
+    </div>
+</div>
+</body>
+</html>";
+}
+
+
+// ---------- Страница «Данные приняты» ----------
+static string WrapThanks(Order order)
+{
+    return $@"
+<!DOCTYPE html>
+<html lang='ru'>
+<head>
+<meta charset='utf-8'>
+<title>Данные приняты — Поток</title>
+<style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #111318; color: #F1F3F5;
+            min-height: 100vh; display: flex; align-items: center; justify-content: center;
+            padding: 24px; text-align: center; }}
+    .container {{ max-width: 520px; }}
+    .check {{ width: 80px; height: 80px; margin: 0 auto 24px;
+              background: linear-gradient(135deg, #63C7A0, #3FA37F);
+              border-radius: 50%; display: flex; align-items: center; justify-content: center;
+              font-size: 40px; }}
+    h1 {{ font-size: 28px; margin-bottom: 12px; }}
+    p {{ color: #A9B0BB; margin-bottom: 12px; }}
+    .info {{ background: #1D2128; border: 1px solid #2A303A;
+             border-radius: 12px; padding: 20px; margin-top: 24px;
+             text-align: left; font-size: 14px; color: #A9B0BB; }}
+    .info b {{ color: #A78BFA; }}
+</style>
+</head>
+<body>
+<div class='container'>
+    <div class='check'>✓</div>
+    <h1>Данные приняты!</h1>
+    <p>Заказ №{order.OrderId} успешно обработан.</p>
+
+    <div class='info'>
+        <p><b>Что дальше?</b></p>
+        <p style='margin-top:8px;'>
+            Серийные номера и номера партий сохранены в системе.
+            Документ прихода сформирован автоматически.
+        </p>
+        <p style='margin-top:12px;color:#63C7A0;'>
+            Можете закрыть эту страницу.
+        </p>
+    </div>
+</div>
+</body>
+</html>";
+}
+
+
+// ---------- Страница ошибки при загрузке ----------
+static string WrapUploadError(Guid token, long orderId, string message)
+{
+    return $@"
+<!DOCTYPE html>
+<html lang='ru'>
+<head>
+<meta charset='utf-8'>
+<title>Ошибка загрузки — Поток</title>
+<style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+            background: #111318; color: #F1F3F5;
+            min-height: 100vh; display: flex; align-items: center; justify-content: center;
+            padding: 24px; text-align: center; }}
+    .container {{ max-width: 520px; }}
+    .icon {{ width: 80px; height: 80px; margin: 0 auto 24px;
+             background: linear-gradient(135deg, #E57979, #C64D4D);
+             border-radius: 50%; display: flex; align-items: center; justify-content: center;
+             font-size: 40px; color: white; }}
+    h1 {{ font-size: 28px; margin-bottom: 12px; }}
+    p {{ color: #A9B0BB; margin-bottom: 12px; }}
+    .error {{ background: #2A1818; border: 1px solid #E57979;
+              border-radius: 12px; padding: 16px; margin-top: 24px;
+              text-align: left; font-size: 13px; color: #E57979;
+              word-break: break-word; }}
+    .btn {{ display: inline-block; padding: 14px 28px;
+            background: #A78BFA; color: white;
+            text-decoration: none; border-radius: 10px;
+            font-weight: 600; margin-top: 24px; }}
+    .btn:hover {{ background: #B69CFF; }}
+</style>
+</head>
+<body>
+<div class='container'>
+    <div class='icon'>!</div>
+    <h1>Ошибка загрузки</h1>
+    <p>Не удалось обработать файл для заказа №{orderId}.</p>
+
+    <div class='error'>
+        {message}
     </div>
 
-    <a href='/template/{token}' class='btn'>
-        📄 Скачать шаблон Excel
-    </a>
+    <a href='/view/{token}/0' class='btn'>← Вернуться к заказу</a>
 </div>
 </body>
 </html>";
