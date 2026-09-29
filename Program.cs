@@ -424,7 +424,7 @@ app.MapPost("/upload/{token}", async (Guid token, HttpRequest request) =>
                 NomenclatureId = oi.NomenclatureId,
                 SerialNumber = sn,
                 BatchNumber = bn,
-                Quantity = string.IsNullOrEmpty(sn) ? qty : 1
+                Quantity = qty
             });
         }
 
